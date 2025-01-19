@@ -6,15 +6,14 @@ or tested. Use at your own risk.
 
 Features:
 - Periodic ping tests to monitor latency (default: every 10 seconds)
-- Regular speed tests to measure bandwidth (default: every 60 seconds) 
+- Regular speed tests to measure bandwidth (default: every 120 seconds) 
 - Metrics stored in InfluxDB time series database
-- Multithreaded design to prevent speed tests from blocking ping measurements
 - Configuration stored in netmon.ini file
 
 Requirements:
 - Python 3.6+
 - InfluxDB Cloud or local InfluxDB instance
-- Required packages: influxdb-client-3, speedtest-cli, ping3
+- Required packages: influxdb3-python, speedtest-cli, ping3
 
 Usage:
     python netmon.py [-d/--debug]
@@ -32,8 +31,6 @@ import argparse
 import speedtest
 import subprocess
 import json
-import threading
-from queue import Queue, Empty
 
 # Add argument parsing before logging config
 parser = argparse.ArgumentParser(description='Network monitoring tool')
@@ -49,7 +46,7 @@ logging.basicConfig(
 # Monitoring configuration
 PING_TARGET = "8.8.8.8"  # Google DNS server
 PING_INTERVAL = 10  # seconds
-SPEEDTEST_INTERVAL = 60  # seconds
+SPEEDTEST_INTERVAL = 120  # seconds
 CONFIG_PATH = "netmon.ini"
 
 def _enter_user_config():
@@ -130,19 +127,20 @@ class NetworkMonitor:
         self.speedtest = speedtest.Speedtest()
         self.last_speedtest = None
         self.last_ping = None
+        self.speedtest_cooldown = None  # Track when speedtest finished
         
-        # Add queues for metric collection
-        self.metric_queue = Queue()
-        
-        # Initialize threads
-        self.ping_thread = None
-        self.speedtest_thread = None
+        # Remove threading-related initialization
         self.running = False
 
     def get_ping_stats(self):
         """Get ping statistics to target"""
         try:
             now = datetime.now()
+            # Don't ping if we're in speedtest cooldown period
+            if (self.speedtest_cooldown and 
+                (now - self.speedtest_cooldown).total_seconds() < PING_INTERVAL):
+                return None
+                
             if (self.last_ping is None or 
                 (now - self.last_ping).total_seconds() >= PING_INTERVAL):
                 ping_time = ping3.ping(PING_TARGET) * 1000  # Convert to milliseconds
@@ -189,40 +187,12 @@ class NetworkMonitor:
                 download_speed = self.speedtest.download()
                 upload_speed = self.speedtest.upload()
                 self.last_speedtest = now
+                self.speedtest_cooldown = now  # Set cooldown timestamp
                 return download_speed, upload_speed
             return None, None
         except Exception as e:
             logging.error(f"Error during speed test: {e}")
             return None, None
-
-    def ping_worker(self):
-        """Worker thread for ping measurements"""
-        while self.running:
-            try:
-                ping_time = self.get_ping_stats()
-                if ping_time is not None:
-                    logging.info(f"Network metrics - Ping: {ping_time:.2f}ms")
-                    self.metric_queue.put(('ping', ping_time))
-                time.sleep(PING_INTERVAL)
-            except Exception as e:
-                logging.error(f"Error in ping worker: {e}")
-                time.sleep(PING_INTERVAL)
-
-    def speedtest_worker(self):
-        """Worker thread for speed tests"""
-        while self.running:
-            try:
-                download_speed, upload_speed = self.get_speed_test()
-                if download_speed is not None and upload_speed is not None:
-                    logging.info(
-                        f"Network metrics - Download: {download_speed/1_000_000:.2f} Mbps, "
-                        f"Upload: {upload_speed/1_000_000:.2f} Mbps"
-                    )
-                    self.metric_queue.put(('speed', (download_speed, upload_speed)))
-                time.sleep(1)  # Short sleep to prevent CPU spinning
-            except Exception as e:
-                logging.error(f"Error in speedtest worker: {e}")
-                time.sleep(SPEEDTEST_INTERVAL)
 
     def run(self):
         """Main monitoring loop"""
@@ -230,31 +200,28 @@ class NetworkMonitor:
             logging.info("Starting network monitoring...")
             self.running = True
             
-            # Start worker threads
-            self.ping_thread = threading.Thread(target=self.ping_worker, daemon=True)
-            self.speedtest_thread = threading.Thread(target=self.speedtest_worker, daemon=True)
-            
-            self.ping_thread.start()
-            self.speedtest_thread.start()
-            
-            # Main loop processes the metric queue and writes to InfluxDB
             while self.running:
                 try:
-                    # Get metric from queue with timeout
-                    metric_type, value = self.metric_queue.get(timeout=1)
-                    
-                    # Write to InfluxDB based on metric type
-                    if metric_type == 'ping':
-                        self.write_to_influx(ping_time=value)
-                    elif metric_type == 'speed':
-                        download_speed, upload_speed = value
+                    # Run speed test if interval has elapsed
+                    download_speed, upload_speed = self.get_speed_test()
+                    if download_speed is not None and upload_speed is not None:
+                        logging.info(
+                            f"Network metrics - Download: {download_speed/1_000_000:.2f} Mbps, "
+                            f"Upload: {upload_speed/1_000_000:.2f} Mbps"
+                        )
                         self.write_to_influx(
                             download_speed=download_speed,
                             upload_speed=upload_speed
                         )
+                    # Only run ping test if we're not in speedtest interval
+                    else:
+                        ping_time = self.get_ping_stats()
+                        if ping_time is not None:
+                            logging.info(f"Network metrics - Ping: {ping_time:.2f}ms")
+                            self.write_to_influx(ping_time=ping_time)
                     
-                except Empty:
-                    continue  # No metrics to process
+                    time.sleep(PING_INTERVAL)
+                    
                 except Exception as e:
                     logging.error(f"Error processing metrics: {e}")
                     time.sleep(1)
@@ -262,17 +229,7 @@ class NetworkMonitor:
         except KeyboardInterrupt:
             logging.info("Received shutdown signal, cleaning up...")
         finally:
-            # Ensure cleanup happens whether we get KeyboardInterrupt or another exception
             self.running = False
-            logging.info("Waiting for threads to finish...")
-            
-            # Give threads a chance to finish cleanly
-            try:
-                self.ping_thread.join(timeout=5)
-                self.speedtest_thread.join(timeout=5)
-            except Exception as e:
-                logging.error(f"Error during thread cleanup: {e}")
-            
             logging.info("Network monitoring stopped.")
 
 if __name__ == "__main__":
