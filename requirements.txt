@@ -1,6 +1,7 @@
 certifi==2024.12.14
 influxdb3-python==0.10.0
 ping3==4.0.8
+psutil==6.1.1
 pyarrow==19.0.0
 python-dateutil==2.9.0.post0
 reactivex==4.0.4
